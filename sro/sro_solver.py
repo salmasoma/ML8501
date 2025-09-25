@@ -65,7 +65,7 @@ class IterativeSRO:
             gram = sketched.T @ sketched
             if sketch_config.method != "none":
                 gram = gram + global_lipschitz * identity
-            lipschitz = float(np.linalg.norm(gram, ord=2) + 1e-12)
+            lipschitz = float(np.linalg.norm(sketched, ord=2) ** 2 + 1e-12)
             step_size = self.step_scale / lipschitz
 
             beta_prev = beta.copy()
