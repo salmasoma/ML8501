@@ -5,10 +5,12 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.linear_model import Lasso, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
@@ -84,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of rows for sketches (default: 128).",
     )
     parser.add_argument(
+        "--count-size",
+        type=int,
+        default=None,
+        help="Number of CountSketch rows when using count/count_gaussian (default: 2x sketch-size or n_samples).",
+    )
+    parser.add_argument(
         "--lasso-strength",
         type=float,
         default=0.01,  # Reduced from 0.05
@@ -124,6 +132,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional directory where per-run optimisation traces are stored as JSON.",
+    )
+    parser.add_argument(
+        "--figure-dir",
+        type=Path,
+        default=None,
+        help="Optional directory where convergence and comparison plots will be saved.",
     )
     parser.add_argument(
         "--output",
@@ -183,13 +197,66 @@ def _generate_synthetic(n_samples: int, n_features: int, seed: int) -> Tuple[np.
 def build_sro_configs(
     args: argparse.Namespace, n_train: int
 ) -> Iterable[Tuple[str, SketchConfig]]:
-    sketch_size = min(args.sketch_size, n_train)
-    configs = [
+    if n_train <= 0:
+        return [("none", SketchConfig(method="none"))]
+
+    sketch_size = max(0, min(args.sketch_size, n_train))
+    count_size = (
+        min(args.count_size, n_train)
+        if args.count_size is not None
+        else min(n_train, max(sketch_size, 1) * 2)
+    )
+
+    configs: List[Tuple[str, SketchConfig]] = [
         ("none", SketchConfig(method="none")),
     ]
-    # Only add sketching if we have a reasonable number of samples
-    if sketch_size >= 32 and sketch_size < n_train:
-        configs.append(("subsampled", SketchConfig(method="subsampling", sketch_size=sketch_size, random_state=args.random_state)))
+
+    if sketch_size > 0:
+        configs.append(
+            (
+                "gaussian",
+                SketchConfig(
+                    method="gaussian",
+                    sketch_size=sketch_size,
+                    random_state=args.random_state,
+                ),
+            )
+        )
+        configs.append(
+            (
+                "srht",
+                SketchConfig(
+                    method="srht",
+                    sketch_size=sketch_size,
+                    random_state=args.random_state,
+                ),
+            )
+        )
+
+    if count_size and count_size > 0:
+        configs.append(
+            (
+                "count",
+                SketchConfig(
+                    method="count",
+                    sketch_size=count_size,
+                    random_state=args.random_state,
+                ),
+            )
+        )
+        if sketch_size > 0:
+            configs.append(
+                (
+                    "count_gaussian",
+                    SketchConfig(
+                        method="count_gaussian",
+                        sketch_size=sketch_size,
+                        count_size=count_size,
+                        random_state=args.random_state,
+                    ),
+                )
+            )
+
     return configs
 
 
@@ -208,7 +275,7 @@ def evaluate_models(
     y_train: np.ndarray,
     y_test: np.ndarray,
     args: argparse.Namespace,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, List[Dict[str, object]]]:
     # Standardize features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -219,22 +286,46 @@ def evaluate_models(
     y_train_centered = y_train - y_mean
     
     results: List[Dict[str, object]] = []
+    histories: List[Dict[str, object]] = []
 
     # Baseline models
     baselines = {
-        "Ridge": Ridge(alpha=args.ridge_strength, random_state=args.random_state),
-        "Lasso": Lasso(alpha=args.lasso_strength, max_iter=10000, tol=1e-4, random_state=args.random_state),
+        "Ridge": Ridge(alpha=args.ridge_strength),
+        "Lasso": Lasso(
+            alpha=args.lasso_strength,
+            max_iter=10000,
+            tol=1e-4,
+            random_state=args.random_state,
+        ),
     }
 
     for name, model in baselines.items():
         try:
             model.fit(X_train_scaled, y_train_centered)
             y_pred = model.predict(X_test_scaled) + y_mean  # Add back the mean
-            results.append(_make_result_row(name, "baseline", y_test, y_pred))
+            results.append(
+                _make_result_row(
+                    name,
+                    "baseline",
+                    y_test,
+                    y_pred,
+                    regularizer=name,
+                    subspace="baseline",
+                )
+            )
         except Exception as e:
             print(f"Warning: {name} baseline failed: {e}")
             # Add a dummy result to show the failure
-            results.append(_make_result_row(name + " (failed)", "baseline", y_test, np.full_like(y_test, y_mean)))
+            results.append(
+                _make_result_row(
+                    name + " (failed)",
+                    "baseline",
+                    y_test,
+                    np.full_like(y_test, y_mean),
+                    regularizer=name,
+                    subspace="baseline",
+                )
+            )
 
     # SRO models
     regularizers = build_regularizers(args)
@@ -256,21 +347,57 @@ def evaluate_models(
                 )
                 solver.fit(X_train_scaled, y_train_centered)
                 y_pred = solver.predict(X_test_scaled) + y_mean  # Add back the mean
-                results.append(_make_result_row(tag, "sro", y_test, y_pred))
+                results.append(
+                    _make_result_row(
+                        tag,
+                        "sro",
+                        y_test,
+                        y_pred,
+                        regularizer=reg_name,
+                        subspace=sketch_name,
+                    )
+                )
+                history_frame = pd.DataFrame(solver.get_history())
+                if not history_frame.empty:
+                    histories.append(
+                        {
+                            "model": tag,
+                            "regularizer": reg_name,
+                            "subspace": sketch_name,
+                            "history": history_frame,
+                        }
+                    )
                 _maybe_dump_history(args.history_dir, tag, solver)
             except Exception as e:
                 print(f"Warning: {tag} failed: {e}")
                 # Add a dummy result to show the failure
-                results.append(_make_result_row(tag + " (failed)", "sro", y_test, np.full_like(y_test, y_mean)))
+                results.append(
+                    _make_result_row(
+                        tag + " (failed)",
+                        "sro",
+                        y_test,
+                        np.full_like(y_test, y_mean),
+                        regularizer=reg_name,
+                        subspace=sketch_name,
+                    )
+                )
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), histories
 
 
-def _make_result_row(model_name: str, family: str, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, object]:
+def _make_result_row(
+    model_name: str,
+    family: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    regularizer: Optional[str] = None,
+    subspace: Optional[str] = None,
+) -> Dict[str, object]:
     # Ensure predictions are finite
     y_pred = np.where(np.isfinite(y_pred), y_pred, np.mean(y_true))
     
-    return {
+    row = {
         "model": model_name,
         "family": family,
         "mae": mean_absolute_error(y_true, y_pred),
@@ -278,6 +405,11 @@ def _make_result_row(model_name: str, family: str, y_true: np.ndarray, y_pred: n
         "rmse": np.sqrt(mean_squared_error(y_true, y_pred)),
         "r2": r2_score(y_true, y_pred),
     }
+    if regularizer is not None:
+        row["regularizer"] = regularizer
+    if subspace is not None:
+        row["subspace"] = subspace
+    return row
 
 
 def _maybe_dump_history(history_dir: Path | None, tag: str, solver: IterativeSRO) -> None:
@@ -287,6 +419,145 @@ def _maybe_dump_history(history_dir: Path | None, tag: str, solver: IterativeSRO
     path = history_dir / f"{tag}.json"
     with path.open("w", encoding="utf-8") as file:
         json.dump(solver.get_history(), file, indent=2)
+
+
+def create_comparison_table(results: pd.DataFrame) -> pd.DataFrame:
+    metrics = ["mae", "mse", "rmse", "r2"]
+    if not set(["regularizer", "subspace"]).issubset(results.columns):
+        return (
+            results.set_index(["family", "model"])[metrics]
+            if "model" in results.columns
+            else results[metrics]
+        )
+
+    enriched = results.copy()
+    enriched["regularizer"] = enriched["regularizer"].fillna(enriched["model"])
+    enriched["subspace"] = enriched["subspace"].fillna("baseline")
+
+    pivot = enriched.pivot_table(
+        index=["family", "regularizer"],
+        columns="subspace",
+        values=metrics,
+    ).sort_index()
+
+    if isinstance(pivot.columns, pd.MultiIndex):
+        pivot = pivot.sort_index(axis=1, level=0)
+        pivot.columns = [f"{subspace}_{metric}" for metric, subspace in pivot.columns]
+
+    return pivot
+
+
+def generate_visualisations(
+    results: pd.DataFrame,
+    histories: List[Dict[str, object]],
+    figure_dir: Path | None,
+) -> None:
+    if figure_dir is None:
+        return
+
+    sns.set_theme(style="whitegrid")
+    plot_metric_bars(results, figure_dir)
+    plot_convergence(histories, figure_dir)
+
+
+def plot_metric_bars(results: pd.DataFrame, figure_dir: Path) -> None:
+    metrics = ["mae", "rmse", "r2"]
+    plot_data = results.copy()
+    plot_data["regularizer"] = plot_data["regularizer"].fillna(plot_data["model"])
+    plot_data["subspace"] = plot_data["subspace"].fillna("baseline")
+
+    order_map = {
+        "baseline": 0,
+        "none": 1,
+        "gaussian": 2,
+        "count": 3,
+        "count_gaussian": 4,
+        "srht": 5,
+    }
+    plot_data["subspace_order"] = plot_data["subspace"].map(order_map).fillna(99)
+    subspace_order = (
+        plot_data.sort_values("subspace_order")["subspace"].drop_duplicates().tolist()
+    )
+
+    regularizer_labels = plot_data["regularizer"].astype(str)
+    sro_mask = plot_data["family"] == "sro"
+    regularizer_labels.loc[sro_mask] = (
+        regularizer_labels.loc[sro_mask].str.replace("_", " ").str.title()
+    )
+    plot_data["regularizer_label"] = regularizer_labels
+    plot_data["reg_order"] = np.where(plot_data["family"] == "baseline", 0, 1)
+    regularizer_order = (
+        plot_data.sort_values(["reg_order", "regularizer_label"])["regularizer_label"]
+        .drop_duplicates()
+        .tolist()
+    )
+
+    for metric in metrics:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.barplot(
+            data=plot_data,
+            x="subspace",
+            y=metric,
+            hue="regularizer_label",
+            order=subspace_order,
+            hue_order=regularizer_order,
+            ax=ax,
+        )
+        ax.set_xlabel("Subspace / Sketch Type")
+        ax.set_ylabel(metric.upper())
+        ax.set_title(f"{metric.upper()} comparison across subspaces")
+        ax.legend(title="Regulariser")
+        fig.tight_layout()
+        output_path = figure_dir / f"{metric}_comparison.png"
+        fig.savefig(output_path, dpi=300)
+        plt.close(fig)
+
+
+def plot_convergence(histories: List[Dict[str, object]], figure_dir: Path) -> None:
+    if not histories:
+        return
+
+    def _label(entry: Dict[str, object]) -> str:
+        regularizer = str(entry.get("regularizer", ""))
+        regularizer = regularizer.replace("_", " ").title()
+        subspace = str(entry.get("subspace", ""))
+        return f"{regularizer} ({subspace})"
+
+    objective_fig, objective_ax = plt.subplots(figsize=(10, 6))
+    beta_fig, beta_ax = plt.subplots(figsize=(10, 6))
+
+    for entry in histories:
+        history_frame = entry.get("history")
+        if history_frame is None or history_frame.empty:
+            continue
+        label = _label(entry)
+        if "iteration" not in history_frame.columns:
+            history_frame = history_frame.reset_index().rename(columns={"index": "iteration"})
+
+        if "objective" in history_frame.columns:
+            objective_ax.plot(history_frame["iteration"], history_frame["objective"], label=label)
+        if "beta_change" in history_frame.columns:
+            beta_ax.plot(history_frame["iteration"], history_frame["beta_change"], label=label)
+
+    if objective_ax.lines:
+        objective_ax.set_xlabel("Iteration")
+        objective_ax.set_ylabel("Objective value")
+        objective_ax.set_title("Convergence of objective values")
+        objective_ax.legend()
+        objective_ax.grid(True)
+        objective_fig.tight_layout()
+        objective_fig.savefig(figure_dir / "convergence_objective.png", dpi=300)
+    plt.close(objective_fig)
+
+    if beta_ax.lines:
+        beta_ax.set_xlabel("Iteration")
+        beta_ax.set_ylabel(r"$\\|\\beta^{(t)} - \\beta^{(t-1)}\\|_2$")
+        beta_ax.set_title("Iterate change across iterations")
+        beta_ax.legend()
+        beta_ax.grid(True)
+        beta_fig.tight_layout()
+        beta_fig.savefig(figure_dir / "convergence_beta_change.png", dpi=300)
+    plt.close(beta_fig)
 
 
 def main() -> None:
@@ -299,11 +570,25 @@ def main() -> None:
         X, y, test_size=args.test_size, random_state=args.random_state
     )
 
-    results = evaluate_models(X_train, X_test, y_train, y_test, args)
+    results, histories = evaluate_models(X_train, X_test, y_train, y_test, args)
     results = results.sort_values(by="mse").reset_index(drop=True)
 
     print("\nModel comparison (sorted by MSE):")
     print(results.to_string(index=False, float_format=lambda value: f"{value:0.4f}"))
+
+    if args.figure_dir is not None:
+        args.figure_dir.mkdir(parents=True, exist_ok=True)
+
+    comparison_table = create_comparison_table(results)
+    print("\nDetailed comparison by family, regulariser and subspace:")
+    print(comparison_table.round(4).to_string())
+
+    if args.figure_dir is not None:
+        table_path = args.figure_dir / "comparison_table.csv"
+        comparison_table.to_csv(table_path)
+        print(f"Comparison table saved to {table_path}")
+
+    generate_visualisations(results, histories, args.figure_dir)
 
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

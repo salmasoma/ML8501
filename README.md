@@ -6,9 +6,9 @@ successive regularized optimisation (SRO) algorithm from
 and applies it to MMSE prediction tasks on omics datasets.
 
 The code supports both convex (ridge, lasso) and non-convex (SCAD)
-regularisers and offers different sketching strategies, including
-CountSketch and CountSketch+Gaussian sketches implemented through
-[`pylspack`](https://github.com/IBM/pylspack).
+regularisers and offers multiple sketching strategies: Gaussian,
+CountSketch, CountSketch+Gaussian hybrids and SRHT embeddings implemented
+through [`pylspack`](https://github.com/IBM/pylspack).
 
 ## Environment setup
 
@@ -27,7 +27,7 @@ with a CSV omics dataset or generate a synthetic benchmark.
 
 ```bash
 python experiments/run_sro_omics.py --synthetic --iterations 4 --inner-iterations 60 \
-    --sketch-size 64 --count-size 128 --output results.csv
+    --sketch-size 64 --count-size 128 --figure-dir figures --output results.csv
 ```
 
 ### Real omics data
@@ -38,9 +38,13 @@ python experiments/run_sro_omics.py --data path/to/omics.csv --target mmse_colum
 ```
 
 Command-line arguments let you control the choice of regulariser,
-sketch sizes, stopping tolerance and whether sketches are resampled per
-iteration. The script prints a comparison table across baselines (ridge,
-lasso) and the configured SRO models. Optionally, optimisation histories are saved as JSON files.
+sketch sizes (including dedicated CountSketch row counts), stopping
+tolerance and whether sketches are resampled per iteration. The script
+prints a comparison table across baselines (ridge, lasso) and every SRO
+configuration. When `--figure-dir` is provided it also produces grouped
+bar charts for MAE/RMSE/R² across subspaces and convergence plots built
+from the stored optimisation histories. Optionally, optimisation
+histories are saved as JSON files via `--history-dir`.
 
 ## Module overview
 
