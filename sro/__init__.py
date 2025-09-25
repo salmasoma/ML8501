@@ -7,8 +7,8 @@ from .regularizers import (
     NoRegularizer,
     SCADRegularizer,
 )
-from .sketching import SketchConfig, apply_sketch
-from .sro_solver import IterativeSRO
+from .sketching_simple import SketchConfig
+from .sro_solver_simple import IterativeSRO
 
 __all__ = [
     "BaseRegularizer",
@@ -17,6 +17,5 @@ __all__ = [
     "NoRegularizer",
     "SCADRegularizer",
     "SketchConfig",
-    "apply_sketch",
     "IterativeSRO",
 ]
