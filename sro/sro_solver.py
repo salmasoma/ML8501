@@ -53,14 +53,18 @@ class IterativeSRO:
 
         beta = np.zeros(n_features, dtype=np.float64)
         history: List[dict[str, float]] = []
+        identity = np.eye(n_features, dtype=np.float64)
+        global_lipschitz = float(np.linalg.norm(X, ord=2) ** 2 + 1e-12)
 
         for outer_idx in range(self.max_iter):
             residual = y - X @ beta
-            grad_const = X.T @ residual
+            grad_const = -X.T @ residual
 
             sketch_config = self._prepare_sketch_config(outer_idx)
             sketched = apply_sketch(X, sketch_config, reuse_random_state=True)
             gram = sketched.T @ sketched
+            if sketch_config.method != "none":
+                gram = gram + global_lipschitz * identity
             lipschitz = float(np.linalg.norm(sketched, ord=2) ** 2 + 1e-12)
             step_size = self.step_scale / lipschitz
 
