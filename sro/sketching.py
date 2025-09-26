@@ -47,7 +47,7 @@ def apply_sketch(
     """
 
     method = config.method.lower()
-    if method not in {"none", "gaussian", "count", "count_gaussian"}:
+    if method not in {"none", "gaussian", "count", "count_gaussian", "srht"}:
         msg = f"Unknown sketching method '{config.method}'."
         raise ValueError(msg)
 
@@ -81,17 +81,24 @@ def apply_sketch(
             X_csr = sparse.csr_matrix(X_array)
             return leverage_scores.csrcgs(X_csr, m=0, r=r)
 
-        # method == "count_gaussian"
+        if method == "count_gaussian":
+            m = int(config.sketch_size)
+            r = config.count_size if config.count_size is not None else min(n_samples, 2 * m)
+            if m <= 0 or m > n_samples:
+                msg = "Gaussian rows must satisfy 1 <= m <= n_samples."
+                raise ValueError(msg)
+            if r <= 0 or r > n_samples:
+                msg = "Count sketch rows must satisfy 1 <= r <= n_samples."
+                raise ValueError(msg)
+            X_csr = sparse.csr_matrix(X_array)
+            return leverage_scores.csrcgs(X_csr, m=m, r=r)
+
+        # method == "srht"
         m = int(config.sketch_size)
-        r = config.count_size if config.count_size is not None else min(n_samples, 2 * m)
         if m <= 0 or m > n_samples:
-            msg = "Gaussian rows must satisfy 1 <= m <= n_samples."
+            msg = "SRHT sketch size must satisfy 1 <= m <= n_samples."
             raise ValueError(msg)
-        if r <= 0 or r > n_samples:
-            msg = "Count sketch rows must satisfy 1 <= r <= n_samples."
-            raise ValueError(msg)
-        X_csr = sparse.csr_matrix(X_array)
-        return leverage_scores.csrcgs(X_csr, m=m, r=r)
+        return _apply_srht(X_array, m, rng)
     finally:
         if reuse_random_state and config.random_state is not None:
             np.random.set_state(state)
@@ -101,6 +108,47 @@ def _ensure_c_contiguous(X: np.ndarray | sparse.spmatrix) -> np.ndarray:
     if sparse.issparse(X):
         X = X.toarray()
     return np.ascontiguousarray(X, dtype=np.float64)
+
+
+def _apply_srht(X: np.ndarray, sketch_size: int, rng: Generator) -> np.ndarray:
+    """Apply a subsampled randomized Hadamard transform to ``X``."""
+    n_samples, _ = X.shape
+    padded = 1 << (n_samples - 1).bit_length()
+    if padded != n_samples:
+        pad = padded - n_samples
+        X_work = np.pad(X, ((0, pad), (0, 0)), mode="constant")
+    else:
+        X_work = X.copy()
+
+    signs = rng.choice((-1.0, 1.0), size=padded)
+    X_work *= signs[:, None]
+
+    transformed = _fast_hadamard_transform(X_work) / np.sqrt(padded)
+    transformed = transformed[:n_samples]
+    indices = rng.choice(n_samples, size=sketch_size, replace=False)
+    scaling = np.sqrt(n_samples / sketch_size)
+    return transformed[indices] * scaling
+
+
+def _fast_hadamard_transform(X: np.ndarray) -> np.ndarray:
+    """Compute the Walsh-Hadamard transform along the first axis."""
+    H = X.copy()
+    n_rows = H.shape[0]
+    if n_rows & (n_rows - 1) != 0:
+        msg = "Fast Hadamard transform requires the number of rows to be a power of two."
+        raise ValueError(msg)
+
+    step = 1
+    while step < n_rows:
+        span = step * 2
+        for start in range(0, n_rows, span):
+            mid = start + step
+            end = start + span
+            temp = H[start:mid] + H[mid:end]
+            H[mid:end] = H[start:mid] - H[mid:end]
+            H[start:mid] = temp
+        step = span
+    return H
 
 
 __all__ = ["SketchConfig", "apply_sketch"]

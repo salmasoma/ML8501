@@ -3,3 +3,5 @@ pandas>=2.0
 scipy>=1.10
 scikit-learn>=1.4
 pylspack @ git+https://github.com/IBM/pylspack
+matplotlib>=3.7
+seaborn>=0.13

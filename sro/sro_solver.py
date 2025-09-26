@@ -49,29 +49,49 @@ class IterativeSRO:
     def fit(self, X: np.ndarray, y: np.ndarray) -> IterativeSRO:
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64).reshape(-1)
-        _, n_features = X.shape
+        n_samples, n_features = X.shape
 
         beta = np.zeros(n_features, dtype=np.float64)
         history: List[dict[str, float]] = []
 
+        denom = max(float(n_samples), 1.0)
+        XtX_full = X.T @ X / denom
+        Xty_full = X.T @ y / denom
+        lipschitz_full = float(np.linalg.norm(XtX_full, ord=2))
+        if lipschitz_full < 1e-12:
+            lipschitz_full = 1e-12
+
         for outer_idx in range(self.max_iter):
-            residual = y - X @ beta
-            grad_const = X.T @ residual
+            beta_prev = beta.copy()
 
             sketch_config = self._prepare_sketch_config(outer_idx)
-            sketched = apply_sketch(X, sketch_config, reuse_random_state=True)
-            gram = sketched.T @ sketched
-            lipschitz = float(np.linalg.norm(sketched, ord=2) ** 2 + 1e-12)
+            if sketch_config.method == "none":
+                XtX_work = XtX_full
+                Xty_work = Xty_full
+                lipschitz = lipschitz_full
+            else:
+                sketched_X = apply_sketch(X, sketch_config, reuse_random_state=True)
+                sketched_y = apply_sketch(
+                    y.reshape(-1, 1), sketch_config, reuse_random_state=True
+                ).reshape(-1)
+                sketch_denom = max(float(sketched_X.shape[0]), 1.0)
+                XtX_work = sketched_X.T @ sketched_X / sketch_denom
+                Xty_work = sketched_X.T @ sketched_y / sketch_denom
+                lipschitz = float(np.linalg.norm(XtX_work, ord=2))
+                if lipschitz < 1e-12:
+                    lipschitz = 1e-12
+
             step_size = self.step_scale / lipschitz
 
-            beta_prev = beta.copy()
             for _ in range(self.inner_max_iter):
-                grad = gram @ (beta - beta_prev) + grad_const
+                grad = XtX_work @ beta - Xty_work
                 beta_next = self.regularizer.prox(beta - step_size * grad, step_size)
-                if np.linalg.norm(beta_next - beta) <= self.tol:
-                    beta = beta_next
-                    break
+                if not np.isfinite(beta_next).all():
+                    raise FloatingPointError("Encountered non-finite values during optimisation.")
+                change = np.linalg.norm(beta_next - beta)
                 beta = beta_next
+                if change <= self.tol:
+                    break
 
             beta_change = np.linalg.norm(beta - beta_prev)
             obj_val = self._objective(X, y, beta)
@@ -114,7 +134,9 @@ class IterativeSRO:
 
     def _objective(self, X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> float:
         residual = y - X @ beta
-        loss = 0.5 * float(residual @ residual)
+        n_samples = X.shape[0]
+        scale = max(float(n_samples), 1.0)
+        loss = 0.5 * float(residual @ residual) / scale
         penalty = self.regularizer.penalty(beta) if self.regularizer else 0.0
         return loss + penalty
 
